@@ -1,0 +1,180 @@
+<p id="content">
+<p class="blogpost"><h2 class="blogposttitle"><a href="http://antirez.com/post/take-advantage-of-redis-adding-it-to-your-stack.html">How to take advantage of Redis just adding it to your stack </a></h2><p class="blogposttext">Redis is different than other database solutions in many ways: it uses memory as main storage support and disk only for persistence, the data model is pretty unique, it is single threaded and so forth. I think that another big difference is that in order to take advantage of Redis in your production environment you don't need to <i>switch</i> to Redis. You can just use it in order to do new things that were not possible before, or in order to fix old problems.
+<br /><br />
+
+Switching to Redis is of course an option, and many users are using Redis as primary database since they need features or write speed or latency or some other feature, but as you can guess switching is a big step if you have an already running application in production. Also for some other kind of applications Redis may not be the right database: for instance a Redis data set can't be bigger than available memory, so if you have some <i>big data</i> application and a mostly-reads access pattern, Redis is not the right pick.
+<br /><br />
+
+However one thing I like about Redis is that it can solve a lot of problems just <b>adding it to your stack</b> to do things that were too slow or impossible with your existing database. This way you start to take confidence with Redis in an incremental way, starting to use it just to optimize or to create new features in your application. This blog post explores a few use cases showing how people added Redis to existing environments to take advantage of Redis set of features. I'll not report specific use cases with site names and exact configurations, I'll just try to show you class of problems that Redis can solve without being your primary database.
+<br /><br />
+<h3>Slow latest items listings in your home page</h3>
+Can I have a penny for every instance of the following query that is running too slow please?
+<pre class="code">
+SELECT * FROM foo WHERE ... ORDER BY time DESC LIMIT 10
+</pre>
+To have listings like &quot;latest items added by our users&quot; or &quot;latest something else&quot; in web applications is very common, and often a scalability problem. It is pretty counter intuitive that you need to sort stuff if you just want to list items in the same order they were created.
+<br /><br />
+
+Similar problems can be fixed using a Redis pattern that I'll show you with an example. We have a web application where we want to show the latest 20 comments posted by our users. Near to the latest comments box we also have a link &quot;show all&quot; that links to a page where it is possible to show more than the latest 20 comments, and there is also pagination so that I can see the whole comments &quot;time line&quot;.
+<br /><br />
+
+We also assume that every comment is stored in our database, and has an unique incremental ID field.
+<br /><br />
+
+We can make both the home page box and the comments time line page with pagination fast using a simple Redis pattern:
+<ul><li>Every time a new comment is added, we add its ID into a Redis list: <b>LPUSH latest.comments &lt;ID&gt;</b>.</li>
+<li>We also trim the list to a given length, so that Redis will just hold the latest 5000 items: <b>LTRIM latest.comments 0 5000</b>.</li>
+<li>Every time we need to get a range of items for our latest comments usages, we call a function that will do the following (in pseudo code):</li>
+<pre class="code">
+FUNCTION get_latest_comments(start,num_items):
+    id_list = redis.lrange(&quot;latest.comments&quot;,start,start+num_items-1)
+    IF id_list.length &lt; num_items
+        id_list = SQL_DB(&quot;SELECT ... ORDER BY time LIMIT ...&quot;)
+    END
+    RETURN id_list
+END
+</pre>
+</ul>
+What we are doing here is simple. In Redis we are taking a <i>live cache</i>, always updated, of the latest IDs. But we are limited to 5000 IDs, and after the system is started the first time those IDs can be even zero as the list did not existed. So our new function to get the IDs of the latest comments will try to always ask Redis. If our start/count parameters are out of range, we fall back to the database.
+<br /><br />
+
+We never need to &quot;refresh&quot; the cache with this system, and the SQL database (or other type of on-disk data store) will only be pinged if the user is paginating &quot;far&quot; intervals. So never for the home page, and never for the first pages of our comments time line.
+<br /><br />
+
+As you can see here Redis is working as a new element. It is not working as a traditional cache, there are no cache refreshes and the info in the Redis instance is always coherent. It is not either working as a database as you can flush the key and everything will continue working. I call it just a &quot;live cache&quot; but there are better names I bet.
+<br /><br />
+<b>Deletion and filtering</b>
+<br /><br />
+
+Note that it is possible to handle comments deletion using LREM. If deletions are pretty rare another option is to just skip the entry when rendering the specific comment, since our DB query to fetch the comment by ID will report us that the comment is no longe there.
+<br /><br />
+
+Also many times you want to have different listings with different filters. When this filters are limited in number (for example categories) you can simply use a different Redis list for every different filter you have. After all you are just taking 5000 items per list, and Redis can hold millions of items with little memory. As usually is a compromise, use your creativity!
+<br /><br />
+<h3>Leaderboards and related problems</h3>
+Another very common need that is hard to model with good performances in DBs that are not in-memory is to take a list of items, sorted by a score, updated in real time, with many updates arriving every second.
+<br /><br />
+
+The classical example is the leaderboard in an online game, for instance a Facebook game, but this pattern can be applied to a number of different scenarios. In the online game example you receive a very high number of score updates by different users. WIth this scores you usually want to:
+<ul><li>Show a leaderboard with the top #100 scores.</li>
+<li>Show the user its current global rank.</li>
+</ul>
+This operations are trivial using a Redis sorted set, even if you have millions of users and millions of new scores per minute.
+<br /><br />
+
+This is how mount this pattern: every time a new score is received by an user, we do:
+<pre class="code">
+ZADD leaderboard &lt;score&gt; &lt;username&gt;
+</pre>
+<i>Note: you may want to use the user ID instead of the username, it is up to your design</i>
+<br /><br />
+
+To get the top 100 users by score is as easy as <b>ZREVRANGE leaderboard 0 99</b>.
+<br /><br />
+
+Similarly to tell the user its global rank you just do <b>ZRANK leaderboard &lt;username&gt;</b>.
+<br /><br />
+
+Note that you can do more than this, for instance it is trivial to show the user the scores of users &quot;near&quot; his position, that is, to show the portion of the leaderboard that includes the score of our user.
+<h3>Order by user votes and time</h3>
+A notable variation of the above leaderboard pattern is the implementation of a site like Reddit or Hacker News, where news are ordered accordingly to a forumla similar to:
+<pre class="code">
+score = points / time^alpha
+</pre>
+So user votes will raise the news in a proportional way, but time will take the news down exponentially.
+Well the actual algorithm is up to you, this will not change our pattern.
+<br /><br />
+
+This pattern works in this way, starting from the observation that probably only the latest, for instance, 1000 news are good candidates to stay in the home page, so we can ignore all the others.
+The implementation is simple:
+<ul><li>Every time a new news is posted we add the ID into a list, with LPUSH + LTRIM in order to take only the latest 1000 items.</li>
+<li>There is a worker that gets this list and continually computes the final score of every news in this set of 1000 news. The result is used to populate a sorted set with ZADD. Old news are removed from the sorted set in the mean time as a cleanup operation.</li>
+</ul>
+At this point we have a sorted set composed of 1000 news sorted by our score. This sorted set can be queried 100k times per second for the top news, so it will be easy to scale the site this way.
+<br /><br />
+
+The key idea here is that our sorting, made by the background worker, is not a work proportional to the number of users watching the news site.
+<br /><br />
+
+For the &quot;just posted&quot; section the list of IDs can be used raw, or using the first pattern proposed in this blog post.
+<br /><br />
+<h3>Implement expires on items</h3>
+Another way to use sorted sets is to index stuff by time. We just use the unix time as score.
+This can be used in general to index things by time, but a notable usage is to expire things in our main database when a given amount of time has elapsed.
+<br /><br />
+
+This is the pattern:
+<ul><li>Every time a new item is added to our (non Redis) database we add it into the sorted set. As score we use the time at which this item should expire, in other words the current_time+time_to_live.</li>
+<li>There is a background worker doing queries in the sorted set using for instance ZRANGE ... WITHSCORES to take the latest 10 items. If there are scores representing unix times already in the past, we delete this items from the database.</li>
+</ul>
+<br /><br />
+<h3>Counting stuff</h3>
+Redis is a good counter, thanks to INCRBY and other similar commands.
+<br /><br />
+
+How many times you wanted to add new counters in your database, to take statistics or to show new informations to your users, but avoided it since it is a write-intensive task for your database? This happened to me many times in the past.
+<br /><br />
+
+Well, just use Redis and don't care! With atomic increments you can take all your counts, reset them atomically with GETSET if needed, put expires in your counters, so that you can take the count of events only if the time difference between those events is less then a given amount of seconds.
+<br /><br />
+
+For instance using just:
+<pre class="code">
+INCR user:&lt;id&gt;
+EXPIRE user:&lt;id&gt; 60
+</pre>
+You can take the count of how many page views the user did recently, without a pause greater than 60 seconds between page views. When this count reaches, for instance, 20, it is time to show some banner, or reminder, or tip, or what you want.
+<br /><br />
+<h3>Unique N items in a given amount of time</h3>
+Another interesting example of statistic that is trivial to do using Redis but is very hard with other kind of databases is to see how many unique users visited a given resource in a given amount of time.
+For instance I want to know the number of unique registered users, or IP addresses, that accessed a given article in an online newspaper.
+<br /><br />
+
+Every time I get a new pageview I just do the following:
+<pre class="code">
+SADD page:day1:&lt;page_id&gt; &lt;user_id&gt;
+</pre>
+Of course instead of day1 you may want to use the first second of today, as unix time, like: time()-(time()%3600*24), or something like that.
+<br /><br />
+
+Want to know the number of unique users? Just do <b>SCARD page:day1:&lt;page_id&gt;</b>.
+<br /><br />
+
+Need to test if a specific user already accessed that page? Just do <b>SISMEMBER page:day1:&lt;page_id&gt;</b>.
+<br /><br />
+<h3>Real time analysis of what is happening, for stats, anti spam, or whatever</h3>
+We did just a few examples, but if you study the Redis command set and combine the data structures in an interesting way you can model an huge number of real time stats with little efforts, in order to power your anti spam systems, or the quality of service you can provide to user thanks to the new information.
+<br /><br />
+<h3>Pub/Sub</h3>
+Do you know that Redis includes a fairly high performance implementation of Pub/Sub?
+<br /><br />
+
+Redis Pub/Sub is very very simple to use, stable, and fast, with support for pattern matching, ability to subscribe/unsubscribe to channels on the run, and so forth. You can read more about it in the <a href="http://redis.io/topics/pubsub">Redis PubSub official documentation</a>.
+<br /><br />
+<h3>Queues</h3>
+You probably already noticed how Redis commands like list push and list pop make it suitable to implement queues, but you can do more than that: Redis has <a href="http://redis.io/commands/blpop">blocking variants of list pop commands</a> that will block if a list is empty.
+<br /><br />
+
+A common usage of Redis as a queue is the <a href="https://github.com/blog/542-introducing-resque">Resque</a> library, implemented and popularized by Github's folks.
+<br /><br />
+
+With our <a href="http://redis.io/commands/rpoplpush">http://redis.io/commands/rpoplpush</a> list rotation commands it is possible to implement queues with interesting semantics that will make your background workers happier! (For instance you can implement a rotating list to fetch RSS feeds again and again, so that every worker will pick the RSS that was fetched more in the past, and thus needs to be updated ASAP). Similarly using sorted sets it is possible to implement priority queues easily.
+<br /><br />
+<h3>Caching</h3>
+This section alone would deserve a specific blog post... so in short here I'll say that Redis can be used as a replacement for memcached in order to turn your cache into something able to store data in an simpler to update way, so that there is no need to regenerate the data every time. See for reference the first pattern published in this article.
+<br /><br />
+<h3>Redis can fix your problems now!</h3>
+You can use Redis <b>right now</b> to do things that will make your users happier, your systems less complex, your site more responsive. You don't need to replace your current setup in order to use it, just start using Redis to do new things that were otherwise not possible, or hard, or too costly.
+<br /><br />
+
+Have fun!
+<br /><br />
+<b>You can discuss this entry here or into</b> <a href="http://news.ycombinator.com/item?id=2705475">Hacker News</a>.</p><p class="blogpostinfo"><p class="blogpoststats">post read 24902 times<sup><a href="/page/uniquevisitors">*</a></sup> (average 10801.8 visits/day)</p>Posted at 14:21:56 <a href="http://antirez.com/post/take-advantage-of-redis-adding-it-to-your-stack.html">permalink</a> | <a href="http://antirez.com/post/take-advantage-of-redis-adding-it-to-your-stack.html#disqus_thread">discuss</a> | <a href="/print.php?postid=235">print</a> | <a href="http://postli.com/post?t=How+to+take+advantage+of+Redis+just+adding+it+to+your+stack&amp;u=http%3A%2F%2Fantirez.com%2Fpost%2Ftake-advantage-of-redis-adding-it-to-your-stack.html">post it</a> | <a class="tr-linkcount" href="http://technorati.com/search/http://antirez.com/post/take-advantage-of-redis-adding-it-to-your-stack.html">View blog reactions</a></p></p>
+
+<h4>Comments</h4>
+
+
+<noscript>Please enable JavaScript to view the <a href="http://disqus.com/?ref_noscript">comments powered by Disqus.</a></noscript>
+<a href="http://disqus.com" class="dsq-brlink">blog comments powered by </a>
+
+</p>
